@@ -136,6 +136,9 @@ fn process_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
     
+    println!("ADrift v{} (build {})", env!("CARGO_PKG_VERSION"), BUILD_VERSION);
+    println!("----------------------------------------");
+    
     std::fs::create_dir_all(&opt.output_dir)?;
     
     let extensions: Vec<String> = opt.extensions

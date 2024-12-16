@@ -3,3 +3,4 @@
 Cargo.lock
 .env
 .envrc
+target/build_number
