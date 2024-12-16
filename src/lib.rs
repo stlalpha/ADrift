@@ -80,12 +80,10 @@ pub fn detect_commercials(
 
     let mut child = Command::new("ffmpeg")
         .args(&[
-            "-i",
-            input.to_str().unwrap(),
-            "-vf",
-            &format!("blackdetect=d=0.1:pix_th={}", black_threshold),
-            "-f",
-            "null",
+            "-i", input.to_str().unwrap(),
+            "-vf", &format!("blackdetect=d=0.1:pic_th={}:pix_th={}", black_threshold, black_threshold),
+            "-an",  // Ignore audio
+            "-f", "null",
             "-progress", "pipe:1",
             "-"
         ])
@@ -158,6 +156,15 @@ pub fn detect_commercials(
     stderr_thread.join().unwrap();
 
     pb.finish_with_message("Analysis complete");
+    
+    // Add debug information
+    println!("Found {} potential black frame segments", potential_segments.len());
+    
+    if potential_segments.is_empty() {
+        println!("Warning: No black frames detected with threshold {}. Try adjusting the black_threshold parameter.", black_threshold);
+        // Return empty results instead of error
+        return Ok(Vec::new());
+    }
     
     let db = db_path.map(|path| FingerprintDb::new(path))
         .transpose()?;
@@ -339,10 +346,14 @@ fn identify_commercials(
     _min_black_frames: u32,
     db: Option<&FingerprintDb>,
 ) -> Result<Vec<Segment>> {
+    if black_frames.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut segments = Vec::new();
     let mut unique_fingerprints: HashMap<SegmentFingerprint, usize> = HashMap::new();
     
-    let pb = ProgressBar::new((black_frames.len() - 1) as u64);
+    let pb = ProgressBar::new((black_frames.len().saturating_sub(1)) as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")?
@@ -350,60 +361,63 @@ fn identify_commercials(
     );
     pb.set_message("Generating fingerprints...");
 
-    for i in 0..black_frames.len() - 1 {
-        let current_end = black_frames[i].1;
-        let next_start = black_frames[i + 1].0;
-        let duration = next_start - current_end;
-        
-        pb.set_message(format!("Processing segment at {:.1}s", current_end));
-        
-        match generate_segment_fingerprint(input, current_end, next_start) {
-            Ok(fingerprint) => {
-                // Check database first if available
-                if let Some(db) = db {
-                    if let Some(existing_id) = db.find_similar_fingerprint(&fingerprint, SIMILARITY_THRESHOLD)? {
-                        db.update_fingerprint_occurrence(existing_id)?;
-                        pb.inc(1);
-                        continue; // Skip this segment as it's already known
+    // Only process if we have at least 2 black frames
+    if black_frames.len() >= 2 {
+        for i in 0..black_frames.len() - 1 {
+            let current_end = black_frames[i].1;
+            let next_start = black_frames[i + 1].0;
+            let duration = next_start - current_end;
+            
+            pb.set_message(format!("Processing segment at {:.1}s", current_end));
+            
+            match generate_segment_fingerprint(input, current_end, next_start) {
+                Ok(fingerprint) => {
+                    // Check database first if available
+                    if let Some(db) = db {
+                        if let Some(existing_id) = db.find_similar_fingerprint(&fingerprint, SIMILARITY_THRESHOLD)? {
+                            db.update_fingerprint_occurrence(existing_id)?;
+                            pb.inc(1);
+                            continue; // Skip this segment as it's already known
+                        }
                     }
-                }
 
-                // Process new segments
-                if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
-                    if !unique_fingerprints.contains_key(&fingerprint) {
-                        if let Some(db) = db {
-                            db.store_fingerprint(&fingerprint, "station_id")?;
+                    // Process new segments
+                    if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
+                        if !unique_fingerprints.contains_key(&fingerprint) {
+                            if let Some(db) = db {
+                                db.store_fingerprint(&fingerprint, "station_id")?;
+                            }
+                            unique_fingerprints.insert(fingerprint.clone(), segments.len());
+                            segments.push(Segment::StationId {
+                                start_time: current_end,
+                                end_time: next_start,
+                                duration,
+                                fingerprint: Some(fingerprint),
+                                duplicate_of: None,
+                            });
                         }
-                        unique_fingerprints.insert(fingerprint.clone(), segments.len());
-                        segments.push(Segment::StationId {
-                            start_time: current_end,
-                            end_time: next_start,
-                            duration,
-                            fingerprint: Some(fingerprint),
-                            duplicate_of: None,
-                        });
-                    }
-                } else if COMMERCIAL_LENGTHS.iter().any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE) {
-                    if !unique_fingerprints.contains_key(&fingerprint) {
-                        if let Some(db) = db {
-                            db.store_fingerprint(&fingerprint, "commercial")?;
+                    } else if COMMERCIAL_LENGTHS.iter().any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE) {
+                        if !unique_fingerprints.contains_key(&fingerprint) {
+                            if let Some(db) = db {
+                                db.store_fingerprint(&fingerprint, "commercial")?;
+                            }
+                            unique_fingerprints.insert(fingerprint.clone(), segments.len());
+                            segments.push(Segment::Commercial {
+                                start_time: current_end,
+                                end_time: next_start,
+                                duration,
+                                fingerprint: Some(fingerprint),
+                                duplicate_of: None,
+                            });
                         }
-                        unique_fingerprints.insert(fingerprint.clone(), segments.len());
-                        segments.push(Segment::Commercial {
-                            start_time: current_end,
-                            end_time: next_start,
-                            duration,
-                            fingerprint: Some(fingerprint),
-                            duplicate_of: None,
-                        });
                     }
+                },
+                Err(e) => {
+                    eprintln!("Error generating fingerprint at {:.1}s: {}", current_end, e);
                 }
-            },
-            Err(e) => {
-                eprintln!("Error generating fingerprint at {:.1}s: {}", current_end, e);
             }
+            pb.inc(1);
         }
-        pb.inc(1);
     }
     
     pb.finish_with_message("Fingerprint generation complete");
