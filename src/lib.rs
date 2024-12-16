@@ -3,11 +3,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use std::sync::mpsc;
-use std::thread;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::io::BufRead;
 mod db;
 use db::FingerprintDb;
 
@@ -148,7 +147,7 @@ fn check_ffmpeg_version() -> Result<()> {
 
 pub fn detect_commercials(
     input: &Path,
-    black_threshold: f32,
+    _black_threshold: f32,
     min_black_frames: u32,
     db_path: Option<&Path>,
 ) -> Result<Vec<Segment>> {
