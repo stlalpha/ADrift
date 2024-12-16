@@ -12,11 +12,55 @@ mod db;
 use db::FingerprintDb;
 
 // Constants for segment detection
-const COMMERCIAL_LENGTHS: &[f64] = &[15.0, 30.0, 60.0];
+const COMMERCIAL_LENGTHS: &[f64] = &[15.0, 20.0, 25.0, 30.0, 45.0, 60.0];
 const STATION_ID_LENGTHS: &[f64] = &[3.0, 5.0, 10.0];
-const COMMERCIAL_TOLERANCE: f64 = 1.0;
+const COMMERCIAL_TOLERANCE: f64 = 2.0;
 const STATION_ID_TOLERANCE: f64 = 0.2;  // Tighter tolerance for station IDs
 const SIMILARITY_THRESHOLD: f64 = 0.95;
+
+// Constants for black frame detection
+const MIN_BLACK_DURATION: f64 = 0.016;  // About half a frame at 29.97fps
+const BLACK_PIXEL_THRESHOLD: f64 = 0.15; // 15% brightness threshold
+const MIN_SIGNIFICANT_BLACK: f64 = 0.1;  // Minimum duration for "significant" black frames
+const MAX_BLACK_FRAME_GAP: f64 = 0.5;  // Maximum gap between related black frames (500ms)
+
+#[derive(Debug, Clone)]
+pub struct BlackFrameConfig {
+    min_duration: f64,      // Minimum duration of a black frame (default: 0.02s)
+    max_brightness: f64,    // Maximum brightness to consider "black" (0-1)
+    noise_tolerance: f64,   // Tolerance for noise in black frames (0-1)
+    frame_skip: i32,        // Number of frames to skip in analysis
+    min_gap: f64,          // Minimum gap between segments
+    max_gap: f64,          // Maximum gap to consider part of same segment
+}
+
+impl Default for BlackFrameConfig {
+    fn default() -> Self {
+        Self {
+            min_duration: 0.02,        // Comskip: minimum black frame duration
+            max_brightness: 0.08,      // Comskip: stricter black level
+            noise_tolerance: 0.08,     // Comskip: noise threshold
+            frame_skip: 1,            // Check every frame
+            min_gap: 0.1,            // Minimum gap between segments
+            max_gap: 0.5,            // Maximum gap to merge segments
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneChangeConfig {
+    threshold: f64,           // Pixel difference threshold (0.0-1.0)
+    min_scene_length: f64,    // Minimum scene duration in seconds
+}
+
+impl Default for SceneChangeConfig {
+    fn default() -> Self {
+        Self {
+            threshold: 0.4,        // Comskip's default scene change threshold
+            min_scene_length: 0.5, // Minimum scene duration
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SegmentFingerprint {
@@ -62,111 +106,100 @@ pub enum Segment {
     }
 }
 
+#[derive(Debug)]
+struct SegmentBoundary {
+    time: f64,
+    black_frame_score: f64,
+    scene_change_score: f64,
+    total_score: f64,
+}
+
+impl SegmentBoundary {
+    fn new(time: f64) -> Self {
+        Self {
+            time,
+            black_frame_score: 0.0,
+            scene_change_score: 0.0,
+            total_score: 0.0,
+        }
+    }
+
+    fn update_scores(&mut self) {
+        self.total_score = self.black_frame_score * 0.7 + 
+                          self.scene_change_score * 0.3;
+    }
+}
+
+fn check_ffmpeg_version() -> Result<()> {
+    let output = Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .context("Failed to execute ffmpeg")?;
+
+    let version_str = String::from_utf8_lossy(&output.stdout);
+    if !version_str.contains("ffmpeg version 4.") {
+        return Err(anyhow::anyhow!(
+            "This version requires FFmpeg 4.x. Found:\n{}",
+            version_str.lines().next().unwrap_or("unknown version")
+        ));
+    }
+    Ok(())
+}
+
 pub fn detect_commercials(
     input: &Path,
     black_threshold: f32,
     min_black_frames: u32,
     db_path: Option<&Path>,
 ) -> Result<Vec<Segment>> {
-    println!("Analyzing video for commercial breaks and station IDs...");
+    check_ffmpeg_version()?;
     
+    // Initialize configs
+    let black_config = BlackFrameConfig::default();
+    let scene_config = SceneChangeConfig::default();
+
+    println!("Analyzing video for commercial breaks...");
     let duration = get_video_duration(input)?;
     let pb = ProgressBar::new(duration as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")?
-            .progress_chars("=>-")
+    pb.set_style(ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")?);
+
+    // Detect both black frames and scene changes
+    println!("Detecting black frames...");
+    let black_frames = detect_black_frames(input, &black_config)?;
+    
+    println!("Detecting scene changes...");
+    let scene_changes = detect_scene_changes(input, &scene_config)?;
+
+    // Debug output
+    println!("\nDetection summary:");
+    println!("  Found {} black frames", black_frames.len());
+    println!("  Found {} scene changes", scene_changes.len());
+
+    // Score and filter boundaries
+    let scored_boundaries = score_segment_boundaries(
+        &black_frames, 
+        &scene_changes, 
+        black_config.max_gap
     );
-
-    let mut child = Command::new("ffmpeg")
-        .args(&[
-            "-i", input.to_str().unwrap(),
-            "-vf", &format!("blackdetect=d=0.1:pic_th={}:pix_th={},select='not(mod(n,5))'", // Sample every 5th frame
-                black_threshold, black_threshold),
-            "-an",
-            "-f", "null",
-            "-progress", "pipe:1",
-            "-"
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to start FFmpeg")?;
-
-    let stderr = child.stderr.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
     
-    let stdout_reader = std::io::BufReader::new(stdout);
-    let stderr_reader = std::io::BufReader::new(stderr);
-    
-    use std::io::BufRead;
-    
-    // Create channels for communication between threads
-    let (tx_segments, rx_segments) = mpsc::channel();
-    let (tx_progress, rx_progress) = mpsc::channel();
+    println!("\nBoundary scoring summary:");
+    for boundary in &scored_boundaries {
+        println!("  Time: {} (Score: {:.2})", 
+            format_timestamp(boundary.time),
+            boundary.total_score);
+        println!("    Black frame score: {:.2}", boundary.black_frame_score);
+        println!("    Scene change score: {:.2}", boundary.scene_change_score);
+    }
 
-    // Spawn thread for stderr processing (black frame detection)
-    let stderr_thread = thread::spawn(move || {
-        for line in stderr_reader.lines() {
-            if let Ok(line) = line {
-                if line.contains("blackdetect") {
-                    if let Some((start, end)) = parse_black_frame_line(&line) {
-                        let duration = end - start;
-                        if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
-                            tx_progress.send(format!("Potential station ID at {:.1}s", start)).ok();
-                        }
-                        tx_segments.send((start, end)).ok();
-                    }
-                }
-            }
-        }
-    });
-
-    // Process progress updates in main thread
+    // Convert scored boundaries to potential segments
     let mut potential_segments = Vec::new();
-    let mut stderr_done = false;
-    let mut lines = stdout_reader.lines();
-    
-    while !stderr_done {
-        // Check for progress updates
-        if let Some(Ok(line)) = lines.next() {
-            if line.starts_with("out_time_ms=") {
-                if let Ok(time) = line[12..].parse::<u64>() {
-                    pb.set_position(time / 1_000_000);
-                    pb.set_message("Analyzing...");
-                }
-            }
-        }
-
-        // Check for segment updates
-        match rx_segments.try_recv() {
-            Ok((start, end)) => potential_segments.push((start, end)),
-            Err(mpsc::TryRecvError::Disconnected) => stderr_done = true,
-            Err(mpsc::TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-
-        // Check for status messages
-        if let Ok(msg) = rx_progress.try_recv() {
-            pb.set_message(msg);
+    if scored_boundaries.len() >= 2 {
+        for pair in scored_boundaries.windows(2) {
+            potential_segments.push((pair[0].time, pair[1].time));
         }
     }
 
-    // Wait for stderr thread to finish
-    stderr_thread.join().unwrap();
-
-    pb.finish_with_message("Analysis complete");
-    
-    // Add debug information
-    println!("Found {} potential black frame segments", potential_segments.len());
-    
-    if potential_segments.is_empty() {
-        println!("Warning: No black frames detected with threshold {}. Try adjusting the black_threshold parameter.", black_threshold);
-        // Return empty results instead of error
-        return Ok(Vec::new());
-    }
-    
     let db = db_path.map(|path| FingerprintDb::new(path))
         .transpose()?;
 
@@ -176,28 +209,26 @@ pub fn detect_commercials(
         min_black_frames,
         db.as_ref(),
     )?;
-    
-    // Add debug output to see what segments were found
+
+    // Print summary
     println!("\nDetected segments:");
     for segment in &segments {
         match segment {
             Segment::Commercial { start_time, end_time, duration, .. } => {
-                println!("Commercial: start={:.1}s, end={:.1}s, duration={:.1}s", 
-                    start_time, end_time, duration);
+                println!("Commercial: {} to {} (duration: {:.1}s)", 
+                    format_timestamp(*start_time),
+                    format_timestamp(*end_time),
+                    duration);
             },
             Segment::StationId { start_time, end_time, duration, .. } => {
-                println!("Station ID: start={:.1}s, end={:.1}s, duration={:.1}s", 
-                    start_time, end_time, duration);
+                println!("Station ID: {} to {} (duration: {:.1}s)", 
+                    format_timestamp(*start_time),
+                    format_timestamp(*end_time),
+                    duration);
             }
         }
     }
-    
-    // Print summary with unique count
-    let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
-    println!("\nFound {} unique commercials and {} unique station IDs", 
-             commercials.len(), 
-             station_ids.len());
-    
+
     Ok(segments)
 }
 
@@ -278,9 +309,12 @@ pub fn extract_segment(
     pb.set_message(format!("Extracting {} {}/{}", prefix, current, total));
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    Command::new("ffmpeg")
-        .args(&command_args)
-        .output()
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&command_args);
+    
+    print_command(&cmd);
+    
+    cmd.output()
         .with_context(|| format!("Failed to extract {} {}/{}", prefix, current, total))?;
     
     pb.finish_with_message(format!("Extracted {} {}/{}", prefix, current, total));
@@ -289,47 +323,43 @@ pub fn extract_segment(
 }
 
 fn generate_segment_fingerprint(input: &Path, start_time: f64, end_time: f64) -> Result<SegmentFingerprint> {
-    // Generate a low-res video hash with more efficient settings
-    let video_hash = Command::new("ffmpeg")
-        .args(&[
-            "-i", input.to_str().unwrap(),
-            "-ss", &start_time.to_string(),
-            "-t", &(end_time - start_time).to_string(),
-            "-vf", "scale=16:16,format=gray", // Reduce resolution further
-            "-frames:v", "1", // Only take one frame
-            "-f", "rawvideo",
-            "-loglevel", "error",
-            "-"
-        ])
+    // Video hash command
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&[
+        "-i", input.to_str().unwrap(),
+        "-ss", &start_time.to_string(),
+        "-t", &(end_time - start_time).to_string(),
+        "-vf", "scale=16:16,format=gray",
+        "-frames:v", "1",
+        "-f", "rawvideo",
+        "-loglevel", "error",
+        "-"
+    ]);
+    
+    print_command(&cmd);
+    let video_hash = cmd
         .stderr(std::process::Stdio::piped())
         .output()
         .context("Failed to generate video hash")?;
 
-    if !video_hash.status.success() {
-        let error = String::from_utf8_lossy(&video_hash.stderr);
-        return Err(anyhow::anyhow!("FFmpeg video hash failed: {}", error));
-    }
-
-    // Generate audio fingerprint with more efficient settings
-    let audio_hash = Command::new("ffmpeg")
-        .args(&[
-            "-i", input.to_str().unwrap(),
-            "-ss", &start_time.to_string(),
-            "-t", &(end_time - start_time).to_string(),
-            "-ac", "1",
-            "-ar", "4000", // Lower sample rate
-            "-f", "s16le",
-            "-loglevel", "error",
-            "-"
-        ])
+    // Audio hash command
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&[
+        "-i", input.to_str().unwrap(),
+        "-ss", &start_time.to_string(),
+        "-t", &(end_time - start_time).to_string(),
+        "-ac", "1",
+        "-ar", "4000",
+        "-f", "s16le",
+        "-loglevel", "error",
+        "-"
+    ]);
+    
+    print_command(&cmd);
+    let audio_hash = cmd
         .stderr(std::process::Stdio::piped())
         .output()
         .context("Failed to generate audio hash")?;
-
-    if !audio_hash.status.success() {
-        let error = String::from_utf8_lossy(&audio_hash.stderr);
-        return Err(anyhow::anyhow!("FFmpeg audio hash failed: {}", error));
-    }
 
     // Create hashes with error handling
     let video_hash = if !video_hash.stdout.is_empty() {
@@ -387,7 +417,23 @@ fn identify_commercials(
             let next_start = black_frames[i + 1].0;
             let duration = next_start - current_end;
             
-            println!("Checking segment: duration={:.1}s", duration);  // Debug output
+            // Add detailed debugging for segments around our target area
+            if (current_end >= 635.0 && current_end <= 645.0) || 
+               (next_start >= 635.0 && next_start <= 645.0) {
+                println!("\nDebug: [Target Region] Analyzing potential commercial:");
+                println!("  Segment: {:.3}s to {:.3}s (duration: {:.3}s)", 
+                    current_end, next_start, duration);
+                println!("  Commercial match distances:");
+                for &len in COMMERCIAL_LENGTHS {
+                    println!("    {:.1}s commercial: diff = {:.3}s (tolerance: {:.1}s)", 
+                        len, (duration - len).abs(), COMMERCIAL_TOLERANCE);
+                }
+            }
+            
+            println!("\nDebug: Analyzing segment boundaries:");
+            println!("  Previous black frame end: {:.3}s", current_end);
+            println!("  Next black frame start: {:.3}s", next_start);
+            println!("  Segment duration: {:.3}s", duration);
             
             match generate_segment_fingerprint(input, current_end, next_start) {
                 Ok(fingerprint) => {
@@ -479,13 +525,22 @@ fn identify_commercials(
 }
 
 fn get_video_duration(path: &Path) -> Result<f64> {
-    let output = Command::new("ffprobe")
-        .args(&[
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path.to_str().unwrap()
-        ])
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(&[
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path.to_str().unwrap()
+    ]);
+    
+    println!("Debug: Executing: ffprobe {}", 
+        cmd.get_args()
+            .map(|arg| arg.to_str().unwrap_or(""))
+            .collect::<Vec<&str>>()
+            .join(" ")
+    );
+    
+    let output = cmd
         .output()
         .context("Failed to get video duration")?;
     
@@ -493,4 +548,208 @@ fn get_video_duration(path: &Path) -> Result<f64> {
         .trim()
         .parse::<f64>()
         .context("Failed to parse video duration")
+}
+
+fn print_command(cmd: &Command) {
+    let args: Vec<&str> = cmd.get_args()
+        .map(|arg| arg.to_str().unwrap_or(""))
+        .collect();
+    println!("Debug: Executing: ffmpeg {}", args.join(" "));
+}
+
+fn format_timestamp(seconds: f64) -> String {
+    let minutes = (seconds / 60.0) as i32;
+    let secs = (seconds % 60.0) as i32;
+    let centisecs = ((seconds % 1.0) * 100.0) as i32;
+    format!("{:02}:{:02}.{:02}", minutes, secs, centisecs)
+}
+
+// Add the grouping function
+fn group_black_frames(frames: &[(f64, f64)], max_gap: f64) -> Vec<(f64, f64)> {
+    // Filter out insignificant black frames first
+    let significant_frames: Vec<_> = frames.iter()
+        .filter(|&&(start, end)| (end - start) >= MIN_SIGNIFICANT_BLACK)
+        .copied()
+        .collect();
+    
+    println!("DEBUG: Found {} significant black frames out of {}", 
+        significant_frames.len(), frames.len());
+
+    let mut grouped = Vec::new();
+    let mut current_group: Option<(f64, f64)> = None;
+
+    for &(start, end) in &significant_frames {
+        match current_group {
+            Some((group_start, group_end)) => {
+                // Add debug output for groups
+                println!("\nDEBUG: Analyzing potential group:");
+                println!("  Current group: {} to {}", 
+                    format_timestamp(group_start), 
+                    format_timestamp(group_end));
+                println!("  Next frame: {} to {}", 
+                    format_timestamp(start), 
+                    format_timestamp(end));
+                println!("  Gap: {:.3}s", start - group_end);
+                
+                if start - group_end <= max_gap {
+                    // Extend current group
+                    current_group = Some((group_start, end));
+                    println!("  -> Extended group to: {} to {}", 
+                        format_timestamp(group_start), 
+                        format_timestamp(end));
+                } else {
+                    // Start new group
+                    grouped.push((group_start, group_end));
+                    current_group = Some((start, end));
+                    println!("  -> Started new group");
+                }
+            }
+            None => {
+                current_group = Some((start, end));
+                println!("\nDEBUG: Started first group: {} to {}", 
+                    format_timestamp(start), 
+                    format_timestamp(end));
+            }
+        }
+    }
+
+    // Don't forget the last group
+    if let Some(group) = current_group {
+        grouped.push(group);
+    }
+
+    println!("\nDEBUG: Grouping summary:");
+    println!("  Input frames: {}", frames.len());
+    println!("  Output groups: {}", grouped.len());
+    for (i, (start, end)) in grouped.iter().enumerate() {
+        println!("  Group {}: {} to {} (duration: {:.3}s)", 
+            i + 1,
+            format_timestamp(*start), 
+            format_timestamp(*end),
+            end - start);
+    }
+
+    grouped
+} 
+
+pub fn detect_black_frames(
+    input: &Path,
+    config: &BlackFrameConfig,
+) -> Result<Vec<(f64, f64)>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&[
+        "-i", input.to_str().unwrap(),
+        "-vf", &format!(
+            "blackdetect=d={}:pic_th={}:pix_th={},select='not(mod(n,{}))'",
+            config.min_duration,
+            config.max_brightness,
+            config.noise_tolerance,
+            config.frame_skip
+        ),
+        "-an",
+        "-f", "null",
+        "-progress", "pipe:1",
+        "-"
+    ]);
+
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("Failed to start FFmpeg")?;
+
+    let stderr = child.stderr.take().unwrap();
+    let stderr_reader = std::io::BufReader::new(stderr);
+    
+    let mut black_frames = Vec::new();
+    
+    for line in stderr_reader.lines() {
+        if let Ok(line) = line {
+            if line.contains("blackdetect") {
+                if let Some((start, end)) = parse_black_frame_line(&line) {
+                    black_frames.push((start, end));
+                }
+            }
+        }
+    }
+
+    Ok(black_frames)
+} 
+
+pub fn detect_scene_changes(
+    input: &Path,
+    config: &SceneChangeConfig,
+) -> Result<Vec<f64>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(&[
+        "-i", input.to_str().unwrap(),
+        "-vf", &format!(
+            "select='gt(scene,{})',metadata=print:file=-",
+            config.threshold
+        ),
+        "-f", "null",
+        "-"
+    ]);
+
+    let output = cmd
+        .output()
+        .context("Failed to detect scene changes")?;
+
+    // Parse scene change timestamps from FFmpeg output
+    let mut scenes = Vec::new();
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if line.contains("pts_time:") {
+            if let Some(time) = line
+                .split("pts_time:")
+                .nth(1)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+            {
+                if scenes.last().map_or(true, |&last| time - last >= config.min_scene_length) {
+                    scenes.push(time);
+                }
+            }
+        }
+    }
+
+    Ok(scenes)
+} 
+
+// Add function to score potential boundaries
+fn score_segment_boundaries(
+    black_frames: &[(f64, f64)],
+    scene_changes: &[f64],
+    max_gap: f64,
+) -> Vec<SegmentBoundary> {
+    let mut boundaries = Vec::new();
+    
+    // Score black frames
+    for &(start, end) in black_frames {
+        let mut boundary = SegmentBoundary::new(start);
+        boundary.black_frame_score = (end - start).min(1.0);  // Normalize to 0-1
+        boundaries.push(boundary);
+    }
+
+    // Score scene changes
+    for &time in scene_changes {
+        if let Some(boundary) = boundaries.iter_mut()
+            .find(|b| (b.time - time).abs() < max_gap)
+        {
+            boundary.scene_change_score = 1.0;
+        } else {
+            let mut boundary = SegmentBoundary::new(time);
+            boundary.scene_change_score = 1.0;
+            boundaries.push(boundary);
+        }
+    }
+
+    // Calculate final scores
+    for boundary in &mut boundaries {
+        boundary.update_scores();
+    }
+
+    // Sort by time and filter low scores
+    boundaries.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+    boundaries.into_iter()
+        .filter(|b| b.total_score > 0.5)
+        .collect()
 } 

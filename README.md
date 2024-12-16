@@ -35,7 +35,10 @@ Station identifications are equally valuable historical artifacts:
 ## Prerequisites
 
 - Rust (latest stable version)
-- FFmpeg installed on your system
+- FFmpeg version 4.x installed on your system
+  - Note: Currently requires FFmpeg 4.x specifically due to filter compatibility
+  - On macOS: `brew install ffmpeg@4`
+  - On Linux: Check your package manager for ffmpeg-4
 
 ## Installation
 
@@ -52,6 +55,8 @@ cargo install --path .
 ```
 
 ## Usage
+
+Note: ADrift will check for FFmpeg 4.x compatibility at runtime and warn if an incompatible version is detected.
 
 Basic usage:
 ```bash
