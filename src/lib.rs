@@ -161,6 +161,9 @@ pub fn detect_commercials(
     println!("Detecting black frames...");
     let black_frames = detect_black_frames(input, &black_config)?;
     
+    println!("Grouping black frames...");
+    let grouped_frames = group_black_frames(&black_frames, &black_config);
+    
     println!("Detecting scene changes...");
     let scene_changes = detect_scene_changes(input, &scene_config)?;
 
@@ -171,8 +174,8 @@ pub fn detect_commercials(
 
     // Score and filter boundaries
     let scored_boundaries = score_segment_boundaries(
-        &black_frames, 
-        &scene_changes, 
+        &grouped_frames,
+        &scene_changes,
         black_config.max_gap
     );
     
@@ -561,7 +564,10 @@ fn format_timestamp(seconds: f64) -> String {
 fn group_black_frames(frames: &[(f64, f64)], config: &BlackFrameConfig) -> Vec<(f64, f64)> {
     // Filter out insignificant black frames first
     let significant_frames: Vec<_> = frames.iter()
-        .filter(|&&(start, end)| (end - start) >= config.min_gap)
+        .filter(|&&(start, end)| {
+            let duration = end - start;
+            duration >= config.min_gap  // Use min_gap for filtering
+        })
         .copied()
         .collect();
     
