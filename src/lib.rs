@@ -5,12 +5,44 @@ use std::process::Command;
 use std::time::Duration;
 use std::sync::mpsc;
 use std::thread;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+mod db;
+use db::FingerprintDb;
 
 // Constants for segment detection
 const COMMERCIAL_LENGTHS: &[f64] = &[15.0, 30.0, 60.0];
 const STATION_ID_LENGTHS: &[f64] = &[3.0, 5.0, 10.0];
 const COMMERCIAL_TOLERANCE: f64 = 1.0;
 const STATION_ID_TOLERANCE: f64 = 0.2;  // Tighter tolerance for station IDs
+const SIMILARITY_THRESHOLD: f64 = 0.95;
+
+#[derive(Debug, Clone)]
+pub struct SegmentFingerprint {
+    duration: f64,
+    audio_hash: u64,
+    video_hash: u64,
+}
+
+impl PartialEq for SegmentFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        (self.audio_hash == other.audio_hash) && 
+        (self.video_hash == other.video_hash) && 
+        ((self.duration - other.duration).abs() < 0.001)  // Compare floats with tolerance
+    }
+}
+
+impl Eq for SegmentFingerprint {}
+
+impl Hash for SegmentFingerprint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.audio_hash.hash(state);
+        self.video_hash.hash(state);
+        // Hash the duration as an integer milliseconds to avoid float issues
+        ((self.duration * 1000.0) as i64).hash(state);
+    }
+}
 
 #[derive(Debug)]
 pub enum Segment {
@@ -18,11 +50,15 @@ pub enum Segment {
         start_time: f64,
         end_time: f64,
         duration: f64,
+        fingerprint: Option<SegmentFingerprint>,
+        duplicate_of: Option<i64>,
     },
     StationId {
         start_time: f64,
         end_time: f64,
         duration: f64,
+        fingerprint: Option<SegmentFingerprint>,
+        duplicate_of: Option<i64>,
     }
 }
 
@@ -30,6 +66,7 @@ pub fn detect_commercials(
     input: &Path,
     black_threshold: f32,
     min_black_frames: u32,
+    db_path: Option<&Path>,
 ) -> Result<Vec<Segment>> {
     println!("Analyzing video for commercial breaks and station IDs...");
     
@@ -122,11 +159,21 @@ pub fn detect_commercials(
 
     pb.finish_with_message("Analysis complete");
     
-    let segments = identify_commercials(potential_segments, min_black_frames);
+    let db = db_path.map(|path| FingerprintDb::new(path))
+        .transpose()?;
+
+    let segments = identify_commercials(
+        potential_segments,
+        input,
+        min_black_frames,
+        db.as_ref(),
+    )?;
     
-    // Print summary
+    // Print summary with unique count
     let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
-    println!("Found {} commercials and {} station IDs", commercials.len(), station_ids.len());
+    println!("Found {} unique commercials and {} unique station IDs", 
+             commercials.len(), 
+             station_ids.len());
     
     Ok(segments)
 }
@@ -167,10 +214,10 @@ pub fn extract_segment(
         .unwrap_or("unknown");
 
     let (start_time, end_time, prefix, current, total) = match segment {
-        Segment::Commercial { start_time, end_time, duration: _ } => {
+        Segment::Commercial { start_time, end_time, duration: _, fingerprint: _, .. } => {
             (*start_time, *end_time, "commercial", index + 1, commercial_total)
         },
-        Segment::StationId { start_time, end_time, duration: _ } => {
+        Segment::StationId { start_time, end_time, duration: _, fingerprint: _, .. } => {
             (*start_time, *end_time, "station-id", index + 1, station_id_total)
         }
     };
@@ -218,36 +265,149 @@ pub fn extract_segment(
     Ok(())
 }
 
+fn generate_segment_fingerprint(input: &Path, start_time: f64, end_time: f64) -> Result<SegmentFingerprint> {
+    // Generate a low-res video hash
+    let video_hash = Command::new("ffmpeg")
+        .args(&[
+            "-i", input.to_str().unwrap(),
+            "-ss", &start_time.to_string(),
+            "-t", &(end_time - start_time).to_string(),
+            "-vf", "scale=32:32,format=gray", // Downscale to tiny grayscale
+            "-f", "rawvideo",
+            "-loglevel", "error",  // Add this to reduce noise
+            "-"
+        ])
+        .stderr(std::process::Stdio::piped())  // Capture stderr
+        .output()
+        .context("Failed to generate video hash")?;
+
+    if !video_hash.status.success() {
+        let error = String::from_utf8_lossy(&video_hash.stderr);
+        return Err(anyhow::anyhow!("FFmpeg video hash failed: {}", error));
+    }
+
+    // Generate audio fingerprint
+    let audio_hash = Command::new("ffmpeg")
+        .args(&[
+            "-i", input.to_str().unwrap(),
+            "-ss", &start_time.to_string(),
+            "-t", &(end_time - start_time).to_string(),
+            "-ac", "1", // Convert to mono
+            "-ar", "8000", // Low sample rate
+            "-f", "s16le", // Use raw PCM format instead of WAV
+            "-loglevel", "error",  // Add this to reduce noise
+            "-"
+        ])
+        .stderr(std::process::Stdio::piped())  // Capture stderr
+        .output()
+        .context("Failed to generate audio hash")?;
+
+    if !audio_hash.status.success() {
+        let error = String::from_utf8_lossy(&audio_hash.stderr);
+        return Err(anyhow::anyhow!("FFmpeg audio hash failed: {}", error));
+    }
+
+    // Create hashes
+    let mut hasher = DefaultHasher::new();
+    if !video_hash.stdout.is_empty() {
+        video_hash.stdout.hash(&mut hasher);
+    } else {
+        // If no video data, use a default hash
+        "no_video_data".hash(&mut hasher);
+    }
+    let video_hash = hasher.finish();
+
+    let mut hasher = DefaultHasher::new();
+    if !audio_hash.stdout.is_empty() {
+        audio_hash.stdout.hash(&mut hasher);
+    } else {
+        // If no audio data, use a default hash
+        "no_audio_data".hash(&mut hasher);
+    }
+    let audio_hash = hasher.finish();
+
+    Ok(SegmentFingerprint {
+        duration: end_time - start_time,
+        audio_hash,
+        video_hash,
+    })
+}
+
 fn identify_commercials(
     black_frames: Vec<(f64, f64)>,
+    input: &Path,
     _min_black_frames: u32,
-) -> Vec<Segment> {
+    db: Option<&FingerprintDb>,
+) -> Result<Vec<Segment>> {
     let mut segments = Vec::new();
+    let mut unique_fingerprints: HashMap<SegmentFingerprint, usize> = HashMap::new();
     
+    let pb = ProgressBar::new((black_frames.len() - 1) as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")?
+            .progress_chars("=>-")
+    );
+    pb.set_message("Generating fingerprints...");
+
     for i in 0..black_frames.len() - 1 {
         let current_end = black_frames[i].1;
         let next_start = black_frames[i + 1].0;
         let duration = next_start - current_end;
         
-        // Check for station ID first (they have stricter timing)
-        if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
-            segments.push(Segment::StationId {
-                start_time: current_end,
-                end_time: next_start,
-                duration,
-            });
-        } 
-        // Then check for commercials
-        else if COMMERCIAL_LENGTHS.iter().any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE) {
-            segments.push(Segment::Commercial {
-                start_time: current_end,
-                end_time: next_start,
-                duration,
-            });
+        pb.set_message(format!("Processing segment at {:.1}s", current_end));
+        
+        match generate_segment_fingerprint(input, current_end, next_start) {
+            Ok(fingerprint) => {
+                // Check database first if available
+                if let Some(db) = db {
+                    if let Some(existing_id) = db.find_similar_fingerprint(&fingerprint, SIMILARITY_THRESHOLD)? {
+                        db.update_fingerprint_occurrence(existing_id)?;
+                        pb.inc(1);
+                        continue; // Skip this segment as it's already known
+                    }
+                }
+
+                // Process new segments
+                if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
+                    if !unique_fingerprints.contains_key(&fingerprint) {
+                        if let Some(db) = db {
+                            db.store_fingerprint(&fingerprint, "station_id")?;
+                        }
+                        unique_fingerprints.insert(fingerprint.clone(), segments.len());
+                        segments.push(Segment::StationId {
+                            start_time: current_end,
+                            end_time: next_start,
+                            duration,
+                            fingerprint: Some(fingerprint),
+                            duplicate_of: None,
+                        });
+                    }
+                } else if COMMERCIAL_LENGTHS.iter().any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE) {
+                    if !unique_fingerprints.contains_key(&fingerprint) {
+                        if let Some(db) = db {
+                            db.store_fingerprint(&fingerprint, "commercial")?;
+                        }
+                        unique_fingerprints.insert(fingerprint.clone(), segments.len());
+                        segments.push(Segment::Commercial {
+                            start_time: current_end,
+                            end_time: next_start,
+                            duration,
+                            fingerprint: Some(fingerprint),
+                            duplicate_of: None,
+                        });
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("Error generating fingerprint at {:.1}s: {}", current_end, e);
+            }
         }
+        pb.inc(1);
     }
     
-    segments
+    pb.finish_with_message("Fingerprint generation complete");
+    Ok(segments)
 }
 
 fn get_video_duration(path: &Path) -> Result<f64> {

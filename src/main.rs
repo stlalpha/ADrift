@@ -56,6 +56,9 @@ struct Opt {
 
     #[structopt(long, help = "Enable verbose output")]
     verbose: bool,
+
+    #[structopt(long, parse(from_os_str), help = "Path to SQLite database for fingerprint storage")]
+    db_path: Option<PathBuf>,
 }
 
 fn get_output_extension(input_path: &Path, output_format: &OutputFormat) -> String {
@@ -78,11 +81,17 @@ fn process_file(
     black_threshold: f32,
     min_black_frames: u32,
     output_format: &OutputFormat,
+    db_path: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nProcessing: {}", input.display());
     
     let output_ext = get_output_extension(input, output_format);
-    let segments = detect_commercials(input, black_threshold, min_black_frames)?;
+    let segments = detect_commercials(
+        input, 
+        black_threshold, 
+        min_black_frames,
+        db_path,
+    )?;
     
     let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
     let commercial_count = commercials.len();
@@ -153,6 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opt.black_threshold,
                 opt.min_black_frames,
                 &opt.output_format,
+                opt.db_path.as_deref(),
             )?;
         } else {
             println!("Skipping unsupported file: {}", opt.input.display());
@@ -200,6 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opt.black_threshold,
                 opt.min_black_frames,
                 &opt.output_format,
+                opt.db_path.as_deref(),
             ) {
                 eprintln!("Error processing {}: {}", file.display(), e);
             }

@@ -12,3 +12,4 @@ structopt = "0.3"
 anyhow = "1.0"
 indicatif = "0.17"
 walkdir = "2.4"
+rusqlite = { version = "0.29", features = ["bundled"] }
