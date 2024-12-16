@@ -218,35 +218,6 @@ pub fn extract_segment(
     Ok(())
 }
 
-fn parse_black_frames(ffmpeg_output: &str) -> Result<Vec<(f64, f64)>> {
-    let mut sequences = Vec::new();
-    
-    for line in ffmpeg_output.lines() {
-        if line.contains("blackdetect") {
-            // Parse black frame timestamps
-            // Example: [blackdetect @ 0x7f8f9c006800] black_start:10 black_end:12
-            if let (Some(start), Some(end)) = (
-                line.find("black_start:").map(|i| {
-                    line[i..].split(':').nth(1)
-                        .and_then(|s| s.split_whitespace().next())
-                        .and_then(|s| s.parse::<f64>().ok())
-                }),
-                line.find("black_end:").map(|i| {
-                    line[i..].split(':').nth(1)
-                        .and_then(|s| s.split_whitespace().next())
-                        .and_then(|s| s.parse::<f64>().ok())
-                })
-            ) {
-                if let (Some(start), Some(end)) = (start, end) {
-                    sequences.push((start, end));
-                }
-            }
-        }
-    }
-    
-    Ok(sequences)
-}
-
 fn identify_commercials(
     black_frames: Vec<(f64, f64)>,
     _min_black_frames: u32,

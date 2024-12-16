@@ -1,6 +1,5 @@
-mod lib;
-use lib::{Segment, detect_commercials, extract_segment};
-use std::path::PathBuf;
+use adrift::{Segment, detect_commercials, extract_segment};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use structopt::StructOpt;
 
@@ -34,7 +33,7 @@ impl FromStr for OutputFormat {
     about = "ADrift - A tool for discovering and preserving commercials and station IDs from the past"
 )]
 struct Opt {
-    #[structopt(parse(from_os_str), help = "Input video file")]
+    #[structopt(parse(from_os_str), help = "Input video file or directory")]
     input: PathBuf,
     
     #[structopt(parse(from_os_str), help = "Output directory for extracted segments")]
@@ -48,9 +47,18 @@ struct Opt {
 
     #[structopt(long, default_value = "same", help = "Output format: same, mp4, webm, mkv, mov")]
     output_format: OutputFormat,
+
+    #[structopt(long, help = "Process recursively if input is a directory")]
+    recursive: bool,
+
+    #[structopt(long, help = "File extensions to process (comma-separated, e.g. 'mp4,avi,mkv')")]
+    extensions: Option<String>,
+
+    #[structopt(long, help = "Enable verbose output")]
+    verbose: bool,
 }
 
-fn get_output_extension(input_path: &PathBuf, output_format: &OutputFormat) -> String {
+fn get_output_extension(input_path: &Path, output_format: &OutputFormat) -> String {
     match output_format {
         OutputFormat::Same => input_path
             .extension()
@@ -64,24 +72,22 @@ fn get_output_extension(input_path: &PathBuf, output_format: &OutputFormat) -> S
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opt = Opt::from_args();
+fn process_file(
+    input: &Path,
+    output_dir: &Path,
+    black_threshold: f32,
+    min_black_frames: u32,
+    output_format: &OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\nProcessing: {}", input.display());
     
-    // Ensure output directory exists
-    std::fs::create_dir_all(&opt.output_dir)?;
+    let output_ext = get_output_extension(input, output_format);
+    let segments = detect_commercials(input, black_threshold, min_black_frames)?;
     
-    // Get the output format extension
-    let output_ext = get_output_extension(&opt.input, &opt.output_format);
-    
-    // Process the video
-    let segments = detect_commercials(&opt.input, opt.black_threshold, opt.min_black_frames)?;
-    
-    // Split segments and get counts
     let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
     let commercial_count = commercials.len();
     let station_id_count = station_ids.len();
 
-    // Extract each segment with appropriate counter
     let mut commercial_index = 0;
     let mut station_id_index = 0;
 
@@ -89,8 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match segment {
             Segment::Commercial { .. } => {
                 extract_segment(
-                    &opt.input,
-                    &opt.output_dir,
+                    input,
+                    output_dir,
                     commercial_index,
                     commercial_count,
                     station_id_count,
@@ -101,8 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Segment::StationId { .. } => {
                 extract_segment(
-                    &opt.input,
-                    &opt.output_dir,
+                    input,
+                    output_dir,
                     station_id_index,
                     commercial_count,
                     station_id_count,
@@ -112,6 +118,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 station_id_index += 1;
             }
         }
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opt = Opt::from_args();
+    
+    std::fs::create_dir_all(&opt.output_dir)?;
+    
+    let extensions: Vec<String> = opt.extensions
+        .as_deref()
+        .unwrap_or("mp4,avi,mkv,mov,wmv,webm")
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .collect();
+
+    if opt.verbose {
+        println!("Looking for files with extensions: {:?}", extensions);
+    }
+
+    let should_process = |path: &Path| -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| extensions.contains(&ext.to_lowercase()))
+            .unwrap_or(false)
+    };
+
+    if opt.input.is_file() {
+        if should_process(&opt.input) {
+            process_file(
+                &opt.input,
+                &opt.output_dir,
+                opt.black_threshold,
+                opt.min_black_frames,
+                &opt.output_format,
+            )?;
+        } else {
+            println!("Skipping unsupported file: {}", opt.input.display());
+        }
+    } else if opt.input.is_dir() {
+        let mut files: Vec<PathBuf> = Vec::new();
+        
+        let walker = if opt.recursive {
+            walkdir::WalkDir::new(&opt.input)
+        } else {
+            walkdir::WalkDir::new(&opt.input).max_depth(1)
+        };
+
+        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path().to_path_buf();
+            if path.is_file() && should_process(&path) {
+                if opt.verbose {
+                    println!("Found video file: {}", path.display());
+                }
+                files.push(path);
+            }
+        }
+
+        if files.is_empty() {
+            println!("No video files found! Make sure your files have one of these extensions: {:?}", extensions);
+            return Ok(());
+        }
+
+        println!("Found {} files to process", files.len());
+        
+        files.sort();
+
+        let progress = indicatif::ProgressBar::new(files.len() as u64);
+        progress.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")?
+                .progress_chars("=>-")
+        );
+
+        for file in files {
+            progress.set_message(format!("Processing: {}", file.display()));
+            if let Err(e) = process_file(
+                &file,
+                &opt.output_dir,
+                opt.black_threshold,
+                opt.min_black_frames,
+                &opt.output_format,
+            ) {
+                eprintln!("Error processing {}: {}", file.display(), e);
+            }
+            progress.inc(1);
+        }
+
+        progress.finish_with_message("Batch processing complete");
     }
     
     Ok(())
