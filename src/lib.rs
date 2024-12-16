@@ -17,12 +17,6 @@ const COMMERCIAL_TOLERANCE: f64 = 2.0;
 const STATION_ID_TOLERANCE: f64 = 0.2;  // Tighter tolerance for station IDs
 const SIMILARITY_THRESHOLD: f64 = 0.95;
 
-// Constants for black frame detection
-const MIN_BLACK_DURATION: f64 = 0.016;  // About half a frame at 29.97fps
-const BLACK_PIXEL_THRESHOLD: f64 = 0.15; // 15% brightness threshold
-const MIN_SIGNIFICANT_BLACK: f64 = 0.1;  // Minimum duration for "significant" black frames
-const MAX_BLACK_FRAME_GAP: f64 = 0.5;  // Maximum gap between related black frames (500ms)
-
 #[derive(Debug, Clone)]
 pub struct BlackFrameConfig {
     min_duration: f64,      // Minimum duration of a black frame (default: 0.02s)
@@ -564,10 +558,10 @@ fn format_timestamp(seconds: f64) -> String {
 }
 
 // Add the grouping function
-fn group_black_frames(frames: &[(f64, f64)], max_gap: f64) -> Vec<(f64, f64)> {
+fn group_black_frames(frames: &[(f64, f64)], config: &BlackFrameConfig) -> Vec<(f64, f64)> {
     // Filter out insignificant black frames first
     let significant_frames: Vec<_> = frames.iter()
-        .filter(|&&(start, end)| (end - start) >= MIN_SIGNIFICANT_BLACK)
+        .filter(|&&(start, end)| (end - start) >= config.min_gap)
         .copied()
         .collect();
     
@@ -590,7 +584,7 @@ fn group_black_frames(frames: &[(f64, f64)], max_gap: f64) -> Vec<(f64, f64)> {
                     format_timestamp(end));
                 println!("  Gap: {:.3}s", start - group_end);
                 
-                if start - group_end <= max_gap {
+                if start - group_end <= config.max_gap {
                     // Extend current group
                     current_group = Some((group_start, end));
                     println!("  -> Extended group to: {} to {}", 
