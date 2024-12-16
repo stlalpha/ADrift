@@ -81,8 +81,9 @@ pub fn detect_commercials(
     let mut child = Command::new("ffmpeg")
         .args(&[
             "-i", input.to_str().unwrap(),
-            "-vf", &format!("blackdetect=d=0.1:pic_th={}:pix_th={}", black_threshold, black_threshold),
-            "-an",  // Ignore audio
+            "-vf", &format!("blackdetect=d=0.1:pic_th={}:pix_th={},select='not(mod(n,5))'", // Sample every 5th frame
+                black_threshold, black_threshold),
+            "-an",
             "-f", "null",
             "-progress", "pipe:1",
             "-"
@@ -176,9 +177,24 @@ pub fn detect_commercials(
         db.as_ref(),
     )?;
     
+    // Add debug output to see what segments were found
+    println!("\nDetected segments:");
+    for segment in &segments {
+        match segment {
+            Segment::Commercial { start_time, end_time, duration, .. } => {
+                println!("Commercial: start={:.1}s, end={:.1}s, duration={:.1}s", 
+                    start_time, end_time, duration);
+            },
+            Segment::StationId { start_time, end_time, duration, .. } => {
+                println!("Station ID: start={:.1}s, end={:.1}s, duration={:.1}s", 
+                    start_time, end_time, duration);
+            }
+        }
+    }
+    
     // Print summary with unique count
     let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
-    println!("Found {} unique commercials and {} unique station IDs", 
+    println!("\nFound {} unique commercials and {} unique station IDs", 
              commercials.len(), 
              station_ids.len());
     
@@ -273,18 +289,19 @@ pub fn extract_segment(
 }
 
 fn generate_segment_fingerprint(input: &Path, start_time: f64, end_time: f64) -> Result<SegmentFingerprint> {
-    // Generate a low-res video hash
+    // Generate a low-res video hash with more efficient settings
     let video_hash = Command::new("ffmpeg")
         .args(&[
             "-i", input.to_str().unwrap(),
             "-ss", &start_time.to_string(),
             "-t", &(end_time - start_time).to_string(),
-            "-vf", "scale=32:32,format=gray", // Downscale to tiny grayscale
+            "-vf", "scale=16:16,format=gray", // Reduce resolution further
+            "-frames:v", "1", // Only take one frame
             "-f", "rawvideo",
-            "-loglevel", "error",  // Add this to reduce noise
+            "-loglevel", "error",
             "-"
         ])
-        .stderr(std::process::Stdio::piped())  // Capture stderr
+        .stderr(std::process::Stdio::piped())
         .output()
         .context("Failed to generate video hash")?;
 
@@ -293,19 +310,19 @@ fn generate_segment_fingerprint(input: &Path, start_time: f64, end_time: f64) ->
         return Err(anyhow::anyhow!("FFmpeg video hash failed: {}", error));
     }
 
-    // Generate audio fingerprint
+    // Generate audio fingerprint with more efficient settings
     let audio_hash = Command::new("ffmpeg")
         .args(&[
             "-i", input.to_str().unwrap(),
             "-ss", &start_time.to_string(),
             "-t", &(end_time - start_time).to_string(),
-            "-ac", "1", // Convert to mono
-            "-ar", "8000", // Low sample rate
-            "-f", "s16le", // Use raw PCM format instead of WAV
-            "-loglevel", "error",  // Add this to reduce noise
+            "-ac", "1",
+            "-ar", "4000", // Lower sample rate
+            "-f", "s16le",
+            "-loglevel", "error",
             "-"
         ])
-        .stderr(std::process::Stdio::piped())  // Capture stderr
+        .stderr(std::process::Stdio::piped())
         .output()
         .context("Failed to generate audio hash")?;
 
@@ -314,24 +331,26 @@ fn generate_segment_fingerprint(input: &Path, start_time: f64, end_time: f64) ->
         return Err(anyhow::anyhow!("FFmpeg audio hash failed: {}", error));
     }
 
-    // Create hashes
-    let mut hasher = DefaultHasher::new();
-    if !video_hash.stdout.is_empty() {
+    // Create hashes with error handling
+    let video_hash = if !video_hash.stdout.is_empty() {
+        let mut hasher = DefaultHasher::new();
         video_hash.stdout.hash(&mut hasher);
+        hasher.finish()
     } else {
-        // If no video data, use a default hash
+        let mut hasher = DefaultHasher::new();
         "no_video_data".hash(&mut hasher);
-    }
-    let video_hash = hasher.finish();
+        hasher.finish()
+    };
 
-    let mut hasher = DefaultHasher::new();
-    if !audio_hash.stdout.is_empty() {
+    let audio_hash = if !audio_hash.stdout.is_empty() {
+        let mut hasher = DefaultHasher::new();
         audio_hash.stdout.hash(&mut hasher);
+        hasher.finish()
     } else {
-        // If no audio data, use a default hash
+        let mut hasher = DefaultHasher::new();
         "no_audio_data".hash(&mut hasher);
-    }
-    let audio_hash = hasher.finish();
+        hasher.finish()
+    };
 
     Ok(SegmentFingerprint {
         duration: end_time - start_time,
@@ -368,21 +387,56 @@ fn identify_commercials(
             let next_start = black_frames[i + 1].0;
             let duration = next_start - current_end;
             
-            pb.set_message(format!("Processing segment at {:.1}s", current_end));
+            println!("Checking segment: duration={:.1}s", duration);  // Debug output
             
             match generate_segment_fingerprint(input, current_end, next_start) {
                 Ok(fingerprint) => {
+                    // Check if it matches commercial lengths
+                    let is_commercial = COMMERCIAL_LENGTHS.iter()
+                        .any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE);
+                    let is_station_id = STATION_ID_LENGTHS.iter()
+                        .any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE);
+                    
+                    println!("  Is commercial? {} (duration={:.1}s)", is_commercial, duration);
+                    println!("  Is station ID? {} (duration={:.1}s)", is_station_id, duration);
+
                     // Check database first if available
                     if let Some(db) = db {
                         if let Some(existing_id) = db.find_similar_fingerprint(&fingerprint, SIMILARITY_THRESHOLD)? {
                             db.update_fingerprint_occurrence(existing_id)?;
+                            
+                            // Get the type of the existing fingerprint
+                            if let Some(segment_type) = db.get_fingerprint_type(existing_id)? {
+                                // Add to segments based on the stored type
+                                match segment_type.as_str() {
+                                    "commercial" => {
+                                        segments.push(Segment::Commercial {
+                                            start_time: current_end,
+                                            end_time: next_start,
+                                            duration,
+                                            fingerprint: Some(fingerprint),
+                                            duplicate_of: Some(existing_id),
+                                        });
+                                    },
+                                    "station_id" => {
+                                        segments.push(Segment::StationId {
+                                            start_time: current_end,
+                                            end_time: next_start,
+                                            duration,
+                                            fingerprint: Some(fingerprint),
+                                            duplicate_of: Some(existing_id),
+                                        });
+                                    },
+                                    _ => {}
+                                }
+                            }
                             pb.inc(1);
-                            continue; // Skip this segment as it's already known
+                            continue;
                         }
                     }
 
                     // Process new segments
-                    if STATION_ID_LENGTHS.iter().any(|&len| (duration - len).abs() < STATION_ID_TOLERANCE) {
+                    if is_station_id {
                         if !unique_fingerprints.contains_key(&fingerprint) {
                             if let Some(db) = db {
                                 db.store_fingerprint(&fingerprint, "station_id")?;
@@ -396,7 +450,7 @@ fn identify_commercials(
                                 duplicate_of: None,
                             });
                         }
-                    } else if COMMERCIAL_LENGTHS.iter().any(|&len| (duration - len).abs() < COMMERCIAL_TOLERANCE) {
+                    } else if is_commercial {
                         if !unique_fingerprints.contains_key(&fingerprint) {
                             if let Some(db) = db {
                                 db.store_fingerprint(&fingerprint, "commercial")?;

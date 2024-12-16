@@ -102,6 +102,17 @@ impl FingerprintDb {
 
         Ok(())
     }
+
+    pub fn get_fingerprint_type(&self, id: i64) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT segment_type FROM fingerprints WHERE id = ?")?;
+        let mut rows = stmt.query([id])?;
+        
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn calculate_similarity(
