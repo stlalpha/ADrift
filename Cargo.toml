@@ -1,0 +1,11 @@
+[package]
+name = "adrift"
+version = "0.1.0"
+edition = "2021"
+description = "A tool for discovering and preserving commercials from the past"
+authors = ["Jim McBride <stlalpha@themcbros.com>"]
+license = "MIT"
+repository = "https://github.com/stlalpha/adrift"
+
+[dependencies]
+structopt = "0.3" 
