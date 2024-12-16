@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use structopt::StructOpt;
 
+const BUILD_VERSION: &str = env!("BUILD_VERSION");
+
 #[derive(Debug, Clone)]
 enum OutputFormat {
     Same,
