@@ -4,6 +4,7 @@ use std::str::FromStr;
 use structopt::StructOpt;
 
 const BUILD_VERSION: &str = env!("BUILD_VERSION");
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
 enum OutputFormat {
@@ -31,8 +32,13 @@ impl FromStr for OutputFormat {
 
 #[derive(Debug, StructOpt)]
 #[structopt(
-    name = "adrift",
-    about = "ADrift - A tool for discovering and preserving commercials and station IDs from the past"
+    name = "ADrift",
+    about = concat!(
+        "ADrift v", env!("CARGO_PKG_VERSION"), " (build ", env!("BUILD_VERSION"), ")\n",
+        "A tool for discovering and preserving commercials and station IDs from the past"
+    ),
+    version = concat!("v", env!("CARGO_PKG_VERSION"), " (build ", env!("BUILD_VERSION"), ")"),
+    setting = structopt::clap::AppSettings::ColoredHelp,
 )]
 struct Opt {
     #[structopt(parse(from_os_str), help = "Input video file or directory")]
@@ -134,10 +140,18 @@ fn process_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opt = Opt::from_args();
-    
-    println!("ADrift v{} (build {})", env!("CARGO_PKG_VERSION"), BUILD_VERSION);
+    // Always show version info first
+    println!("ADrift v{} (build {})", PKG_VERSION, BUILD_VERSION);
     println!("----------------------------------------");
+
+    let opt = match Opt::from_args_safe() {
+        Ok(opt) => opt,
+        Err(e) => {
+            // Show error and help text
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
     
     std::fs::create_dir_all(&opt.output_dir)?;
     
