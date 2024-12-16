@@ -1,5 +1,5 @@
 mod lib;
-use lib::{Commercial, detect_commercials, extract_commercial};
+use lib::{Segment, detect_commercials, extract_segment};
 use std::path::PathBuf;
 use std::str::FromStr;
 use structopt::StructOpt;
@@ -31,13 +31,13 @@ impl FromStr for OutputFormat {
 #[derive(Debug, StructOpt)]
 #[structopt(
     name = "adrift",
-    about = "ADrift - A tool for discovering and preserving commercials from the past"
+    about = "ADrift - A tool for discovering and preserving commercials and station IDs from the past"
 )]
 struct Opt {
     #[structopt(parse(from_os_str), help = "Input video file")]
     input: PathBuf,
     
-    #[structopt(parse(from_os_str), help = "Output directory for extracted commercials")]
+    #[structopt(parse(from_os_str), help = "Output directory for extracted segments")]
     output_dir: PathBuf,
     
     #[structopt(long, default_value = "0.1", help = "Threshold for black frame detection (0.0-1.0)")]
@@ -74,18 +74,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_ext = get_output_extension(&opt.input, &opt.output_format);
     
     // Process the video
-    let commercials = detect_commercials(&opt.input, opt.black_threshold, opt.min_black_frames)?;
+    let segments = detect_commercials(&opt.input, opt.black_threshold, opt.min_black_frames)?;
     
-    // Extract each commercial
-    for (i, commercial) in commercials.iter().enumerate() {
-        extract_commercial(
-            &opt.input,
-            &opt.output_dir,
-            i,
-            commercial.start_time,
-            commercial.end_time,
-            &output_ext,
-        )?;
+    // Split segments and get counts
+    let (commercials, station_ids): (Vec<_>, Vec<_>) = segments.iter().partition(|s| matches!(s, Segment::Commercial { .. }));
+    let commercial_count = commercials.len();
+    let station_id_count = station_ids.len();
+
+    // Extract each segment with appropriate counter
+    let mut commercial_index = 0;
+    let mut station_id_index = 0;
+
+    for segment in segments.iter() {
+        match segment {
+            Segment::Commercial { .. } => {
+                extract_segment(
+                    &opt.input,
+                    &opt.output_dir,
+                    commercial_index,
+                    commercial_count,
+                    station_id_count,
+                    segment,
+                    &output_ext,
+                )?;
+                commercial_index += 1;
+            },
+            Segment::StationId { .. } => {
+                extract_segment(
+                    &opt.input,
+                    &opt.output_dir,
+                    station_id_index,
+                    commercial_count,
+                    station_id_count,
+                    segment,
+                    &output_ext,
+                )?;
+                station_id_index += 1;
+            }
+        }
     }
     
     Ok(())

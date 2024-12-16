@@ -1,32 +1,36 @@
 # ADrift
 
-ADrift is a Commercial Advertisement Archival Extraction Tool for digitized broadcast content, particularly from the 1980s and 1990s. It identifies commercial segments by analyzing black frame patterns and standard commercial lengths common in broadcast television of that era.
+ADrift is a Commercial Advertisement Archival Extraction Tool for digitized broadcast content, particularly from the 1980s and 1990s. It identifies commercial segments and station identifications by analyzing black frame patterns and standard broadcast timing patterns common in television of that era.
 
 ## Current Capabilities
 
-- Detects commercial segments using:
-  - Black frame analysis (common between commercials in broadcast content)
-  - Standard commercial length matching (15, 30, or 60 seconds)
+- Detects and extracts:
+  - Commercial segments (15, 30, or 60 seconds)
+  - Station IDs (3, 5, or 10 seconds)
+- Uses black frame analysis common in broadcast content
 - Supports multiple input and output formats (MOV, MP4, WebM, MKV)
 - Configurable detection parameters for different source materials
+- Real-time progress tracking and segment identification
 
-## Use Cases
+## Why Preserve These Segments?
 
-- Extracting commercials from digitized broadcast content
-- Preserving regional/local advertising content
-- Processing personal or institutional video collections
-
-
-## Why Preserve Commercials?
-
-Vintage commercials, especially from local broadcasts, capture unique historical content:
-
+### Commercials
+Vintage commercials capture unique historical content:
 - Regional businesses and their stories
 - Local personalities and cultural figures
 - Period-specific pricing and products
 - Evolution of advertising techniques
 - Cultural attitudes and social norms
 - It's pretty fun
+
+### Station IDs
+Station identifications are equally valuable historical artifacts:
+- Local broadcast branding and identity
+- Network affiliate relationships
+- Regional broadcast history
+- Technical broadcast standards
+- Station call signs and channel numbers
+- Often featuring local landmarks or cultural elements
 
 ## Prerequisites
 
